@@ -65,8 +65,8 @@ This project focuses on the comprehensive analysis of gene expression data from 
 
 1. Clone the repository:
    ```bash
-   git clone <[repository-link](https://github.com/martinghl/moment_network_analysis/)>
-   cd Expression_Network_Analysis
+   git clone https://github.com/martinghl/moment_network_analysis.git
+   cd moment_network_analysis
    ```
 
 2. Set up your environment:
