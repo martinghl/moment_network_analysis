@@ -65,7 +65,7 @@ This project focuses on the comprehensive analysis of gene expression data from 
 
 1. Clone the repository:
    ```bash
-   git clone <repository-link>
+   git clone <[repository-link](https://github.com/martinghl/moment_network_analysis/)>
    cd Expression_Network_Analysis
    ```
 
@@ -85,8 +85,7 @@ This project focuses on the comprehensive analysis of gene expression data from 
 ---
 
 ## **Contact**
-For questions or collaborations, contact **Martin Li** via [email@example.com](mailto:email@example.com).
+For questions or collaborations, contact **Martin Li** via [gl1768@nyu.edu](mailto:gl1768@nyu.edu).
 
 ---
 
-**Happy Analyzing!**
