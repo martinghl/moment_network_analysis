@@ -1,0 +1,98 @@
+---
+title: "Differential Expression Analysis"
+output: html_document
+date: "2024-11-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("edgeR", "ggplot2", "ggrepel", "ggalign"))
+
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(ggalign)
+```
+
+```{r}
+# Load the data
+uc_data <- read.csv('S:\\Downloads\\new_uc.csv', row.names = 1)
+hc_data <- read.csv('S:\\Downloads\\new_hc.csv', row.names = 1)
+
+# Ensure that genes (rows) are the same in both datasets
+common_genes <- intersect(rownames(uc_data), rownames(hc_data))
+uc_data <- uc_data[common_genes, ]
+hc_data <- hc_data[common_genes, ]
+
+# Combine the data
+combined_data <- cbind(uc_data, hc_data)
+
+# Create sample labels
+uc_samples <- colnames(uc_data)
+hc_samples <- colnames(hc_data)
+group_labels <- factor(c(rep("UC", length(uc_samples)), rep("HC", length(hc_samples))))
+```
+
+```{r}
+combined_data[combined_data < 0] <- 0
+
+
+# Step 3: 数据转换
+# 将 TPM 数据乘以一个常数，以模拟计数数据
+scaled_data <- round(combined_data * 1000)
+
+# Step 4: 使用 edgeR 进行差异表达分析
+# 创建 DGEList 对象
+dge <- DGEList(counts = scaled_data, group = group_labels)
+
+# 归一化（TMM 方法）
+dge <- calcNormFactors(dge, method = "TMM")
+
+# 设置设计矩阵
+design <- model.matrix(~ group_labels)
+dge <- estimateDisp(dge, design)
+
+# 拟合广义线性模型
+fit <- glmFit(dge, design)
+lrt <- glmLRT(fit, coef = 2)  # UC vs. HC 的比较
+
+# 提取差异表达结果
+res <- topTags(lrt, n = Inf)$table
+
+# 筛选显著差异表达基因
+# 例如：选择 FDR < 0.05 且 |logFC| > 1 的基因
+sig_genes <- subset(res, FDR < 0.05 & abs(logFC) > 1.5)
+
+# 保存显著差异表达基因到 CSV 文件
+write.csv(sig_genes, "significant_genes_edgeR.csv", row.names = TRUE)
+
+# Step 5: 火山图绘制
+# 添加显著性状态列
+res$Significance <- ifelse(res$FDR < 0.05 & abs(res$logFC) > 1,
+                           ifelse(res$logFC > 1, "Upregulated", "Downregulated"),
+                           "Not Significant")
+```
+
+```{r}
+# 使用 ggplot2 绘制火山图
+volcano_plot <- ggplot(res, aes(x = logFC, y = -log10(PValue))) +
+  geom_point(aes(color = Significance), alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(title = "Volcano Plot of Differential Expression", x = "Log2 Fold Change", y = "-Log10 P-value") +
+  theme_minimal()
+
+# 添加标签（可选）
+volcano_plot <- volcano_plot +
+  geom_text_repel(data = subset(res, FDR < 0.05 & abs(logFC) > 2),
+                  aes(label = rownames(subset(res, FDR < 0.05 & abs(logFC) > 2))),
+                  size = 3, box.padding = 0.3)
+
+# 显示火山图
+print(volcano_plot)
+```
+

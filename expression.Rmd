@@ -1,0 +1,871 @@
+---
+title: "Expression Network Analysis"
+author: "Martin Li"
+date: "2024-09-24"
+output:
+  pdf_document:
+    toc: yes
+    latex_engine: "xelatex"
+  word_document:
+    toc: yes
+  html_document:
+    highlight: espresso
+    toc: yes
+---
+# Introduction
+
+This document presents a comprehensive analysis of gene expression data comparing Ulcerative Colitis (UC) patients and Healthy Controls (HC). The analysis includes:
+
+- Differential expression analysis using `limma`.
+- Covariance matrix comparison using high-dimensional covariance tests from the `PEtests` package.
+- Construction of gene co-expression networks.
+- Permutation tests to compare network motifs (triangle counts).
+- Exploration of alternative network metrics.
+- Network analysis using WGCNA (optional).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(stringsAsFactors = FALSE)
+# setwd("S:\\network")
+```
+
+## 1. Load and Preprocess Data
+```{r, warning=FALSE}
+# Load all necessary packages
+library(igraph)
+library(PEtests)
+library(Hmisc)
+library(WGCNA)
+library(ggplot2)
+library(pbapply)
+library(parallel)
+library(limma)
+library(caret)
+library(foreach)
+library(doParallel)
+library(lme4)    # For linear mixed models
+library(huge)    # For high-dimensional correlation tests
+library(progress)
+```
+
+```{r}
+# Load the data
+uc_data <- read.csv('S:\\network\\uc01.csv', row.names = 1)
+hc_data <- read.csv('S:\\network\\hc01.csv', row.names = 1)
+
+# Ensure that genes (rows) are the same in both datasets
+common_genes <- intersect(rownames(uc_data), rownames(hc_data))
+uc_data <- uc_data[common_genes, ]
+hc_data <- hc_data[common_genes, ]
+
+# Combine the data
+combined_data <- cbind(uc_data, hc_data)
+
+# Create sample labels
+uc_samples <- colnames(uc_data)
+hc_samples <- colnames(hc_data)
+group_labels <- factor(c(rep("UC", length(uc_samples)), rep("HC", length(hc_samples))))
+```
+
+# ind = sample(1:9000,500,replace=FALSE)
+# covtest(t(uc_data[ind,]), t(hc_data[ind,]), method = 'lc')
+
+# atemp = cor(t(uc_data)) # correlation matrix
+# btemp = log((1+atemp)/(1-atemp))/2 # fisher transformation~N(0,1/(n-3)) under null, no correlation
+# ctemp = 1-pnorm(abs(btemp) # pvalue for each link
+# dtemp = ctemp<0.05 # using correaltion and multiple tesitng to generate adjencay matrix for network of expression
+
+
+```{r}
+# 定义函数用于比较UC和HC样本之间的网络结构
+expression_network_analysis <- function(uc_data, hc_data, sample_size = 500, alpha = 0.05) {
+  # 1. 抽样索引
+  ind <- sample(1:nrow(uc_data), sample_size, replace = FALSE)
+ 
+  # 2. 协方差矩阵比较测试
+  cov_test_result <- covtest(t(uc_data[ind, ]), t(hc_data[ind, ]), method = 'lc')
+ 
+  # 3. 计算UC样本的相关性矩阵
+  correlation_matrix <- cor(t(uc_data))
+ 
+  # 4. Fisher 转换
+  fisher_transformed <- log((1 + correlation_matrix) / (1 - correlation_matrix)) / 2
+ 
+  # 5. 计算每条边的p值
+  p_values <- 1 - pnorm(abs(fisher_transformed))
+ 
+  # 6. 基于alpha阈值生成邻接矩阵
+  adjacency_matrix <- p_values < alpha
+ 
+  # 7. 返回结果
+  list(
+    cov_test_result = cov_test_result,
+    correlation_matrix = correlation_matrix,
+    p_values = p_values,
+    adjacency_matrix = adjacency_matrix
+  )
+}
+```
+```{r}
+# 示例：调用函数并存储结果
+# result <- expression_network_analysis(uc_data, hc_data)
+
+# 查看结果
+# result$cov_test_result    # 协方差矩阵比较结果
+# result$correlation_matrix # 相关性矩阵
+# result$p_values           # p值矩阵
+# result$adjacency_matrix   # 邻接矩阵
+```
+## 2. Filter Genes Based on Variance
+We remove genes with near-zero variance across samples, which could cause issues in downstream analyses.
+
+```{r}
+# Transpose data to have genes as columns
+data_transposed <- t(combined_data)
+
+# Identify near-zero variance genes
+nzv_genes <- nearZeroVar(data_transposed, saveMetrics = TRUE)
+
+# Filter out near-zero variance genes
+data_filtered <- data_transposed[, !nzv_genes$nzv]
+
+# Transpose back to original format (genes as rows)
+data_filtered <- t(data_filtered)
+
+# Remove genes with NA or infinite values
+data_filtered <- na.omit(data_filtered)
+
+# Check dimensions after filtering
+dim(data_filtered)
+
+```
+
+## 4. High-dimensional Correlation Tests
+
+\section{High-Dimensional Correlation Tests}
+In this section, we perform high-dimensional correlation tests on the residuals of the gene expression data to identify significant gene-gene associations.
+
+\subsection{Model Description}
+
+Given the residual matrix$R = [r_{ij}]$where$i$denotes the gene index and$j$denotes the sample index, we compute the pairwise correlation between genes using Pearson's correlation:
+$$
+\rho_{ij} = \frac{\text{Cov}(r_{i}, r_{j})}{\sqrt{\text{Var}(r_{i}) \text{Var}(r_{j})}}
+$$
+
+where:
+
+\begin{itemize}
+    \item$r_i$is the vector of residuals for gene$i$across all samples.
+    \item$\text{Cov}(r_{i}, r_{j})$is the covariance between the residuals of gene$i$and gene$j$.
+    \item$\text{Var}(r_{i})$and$\text{Var}(r_{j})$are the variances of residuals for genes$i$and$j$, respectively.
+\end{itemize}
+
+\subsection{Parallelized Block-Wise Correlation Computation}
+
+To improve computational efficiency, the gene correlation matrix is computed in blocks. We define the block size$b$and partition the gene residual matrix into smaller blocks of size$b \times b$. For each block, the correlation between the genes is computed using the Pearson correlation formula as defined above.
+
+The total number of blocks$B$is given by:
+
+$$
+B = \left\lceil \frac{p}{b} \right\rceil
+$$
+
+where$p$is the total number of genes, and $b$ is the block size.
+
+The correlation computation is performed for each block in parallel using multiple CPU cores to speed up the process. The correlations are computed in the upper triangular part of the matrix to avoid redundancy.
+
+\subsection{Hypothesis Testing for Correlations}
+For each pairwise correlation, we perform a hypothesis test to determine if the correlation is significantly different from zero. The null hypothesis is:
+
+$$
+H_0: \rho_{ij} = 0
+$$
+
+The test statistic is the t-statistic:
+
+$$
+t = \frac{\rho_{ij} \sqrt{n-2}}{\sqrt{1-\rho_{ij}^2}}
+$$
+
+where$n$is the number of samples.
+
+The p-value for the test is computed as:
+
+$$
+p = 2 \cdot \text{P}(T > |t|), \quad T \sim t_{n-2}
+$$
+where$t_{n-2}$is the t-distribution with$n-2$degrees of freedom.
+
+\subsection{Multiple Testing Correction}
+Since we are performing multiple hypothesis tests for all pairs of genes, we use the Benjamini-Hochberg (BH) procedure to adjust the p-values and control the false discovery rate (FDR). The adjusted p-values are computed as:
+$$
+p_{adj} = \frac{p \cdot m}{\text{rank}(p)}
+$$
+where$m$is the total number of tests, and$\text{rank}(p)$is the rank of the p-value in ascending order.
+
+\subsection{Significant Correlations}
+After adjusting for multiple testing, we select the gene pairs with significant correlations by applying a threshold$\alpha$. The set of significant gene pairs is given by:
+$$
+S = \{ (i,j) : p_{adj} < \alpha \}
+$$
+The significant correlations are then returned as an edge list, representing the gene-gene interactions in the network.
+
+
+
+```{r}
+# Split the filtered data into UC and HC groups
+uc_indices <- which(group_labels == "UC")
+hc_indices <- which(group_labels == "HC")
+
+data_uc <- data_filtered[, uc_indices]
+data_hc <- data_filtered[, hc_indices]
+
+# Transpose data to have samples as rows and genes as columns
+data_uc_t <- t(data_uc)
+data_hc_t <- t(data_hc)
+
+```
+
+```{r, warning = FALSE}
+compute_correlations_parallel <- function(data_matrix, num_cores = NULL, block_size = 500, alpha = 0.05) {
+  if (is.null(num_cores)) {
+    num_cores <- detectCores() - 1  # Use available cores minus one by default
+  }
+
+  # Data should be samples as rows and genes as columns
+  num_genes <- ncol(data_matrix)
+  gene_names <- colnames(data_matrix)
+  num_samples <- nrow(data_matrix)
+
+  # Define function to compute correlation blocks
+  compute_cor_block <- function(start_idx, block_size) {
+    end_idx <- min(start_idx + block_size - 1, num_genes)
+    indices <- start_idx:end_idx
+    data_block <- data_matrix[, indices, drop = FALSE]
+    cor_block <- cor(data_block, data_matrix[, indices:num_genes], use = "pairwise.complete.obs")
+    return(list(start_idx = start_idx, end_idx = end_idx, cor_block = cor_block))
+  }
+
+  # Calculate number of blocks
+  num_blocks <- ceiling(num_genes / block_size)
+  block_start_indices <- seq(1, num_genes, by = block_size)
+
+  # Initialize parallel cluster
+  cl <- makeCluster(num_cores)
+  clusterExport(cl, varlist = c("data_matrix", "num_genes", "num_samples", "block_size"), envir = environment())
+
+  # Use pblapply to compute correlation matrices in parallel with a progress bar
+  library(pbapply)
+  pboptions(type = "txt", style = 3)
+  cor_results <- pblapply(block_start_indices, function(start_idx) {
+    compute_cor_block(start_idx, block_size)
+  }, cl = cl)
+
+  # Stop cluster
+  stopCluster(cl)
+
+  # Initialize lists to store results
+  cor_values_list <- list()
+  row_indices_list <- list()
+  col_indices_list <- list()
+
+  # Collect results
+  for (res in cor_results) {
+    start_idx <- res$start_idx
+    end_idx <- res$end_idx
+    cor_block <- res$cor_block
+
+    # Adjust indices for the upper triangular matrix
+    nr <- nrow(cor_block)
+    nc <- ncol(cor_block)
+    for (i in 1:nr) {
+      row_idx <- start_idx + i - 1
+      col_start <- i + 1
+      if (col_start <= nc) {
+        cor_values <- cor_block[i, col_start:nc]
+        col_indices <- (start_idx + col_start - 1):(start_idx + nc - 1)
+        cor_values_list[[length(cor_values_list) + 1]] <- cor_values
+        row_indices_list[[length(row_indices_list) + 1]] <- rep(row_idx, length(cor_values))
+        col_indices_list[[length(col_indices_list) + 1]] <- col_indices
+      }
+    }
+  }
+
+  # Combine lists
+  cor_values_vec <- unlist(cor_values_list)
+  row_indices_vec <- unlist(row_indices_list)
+  col_indices_vec <- unlist(col_indices_list)
+  
+
+  # Calculate p-values
+  df <- num_samples - 2
+  t_values <- cor_values_vec * sqrt(df / (1 - cor_values_vec^2))
+  p_values <- 2 * pt(-abs(t_values), df)
+
+  # Adjust p-values
+  p_adjusted <- p.adjust(p_values, method = "BH")
+
+  # Select significant gene pairs
+  significant_indices <- which(p_adjusted < alpha)
+
+  significant_corrs <- data.frame(
+    gene1 = gene_names[row_indices_vec[significant_indices]],
+    gene2 = gene_names[col_indices_vec[significant_indices]],
+    r = cor_values_vec[significant_indices],
+    p_value = p_values[significant_indices],
+    p_adjusted = p_adjusted[significant_indices]
+  )
+
+  return(significant_corrs)
+}
+
+```
+### For UC Group and HC
+
+```{r}
+# For UC group
+significant_corrs_uc <- compute_correlations_parallel(data_uc_t, num_cores = 10, block_size = 500, alpha = 0.05)
+
+# For HC group
+significant_corrs_hc <- compute_correlations_parallel(data_hc_t, num_cores = 10, block_size = 500, alpha = 0.05)
+
+# Build UC network
+g_uc <- graph_from_data_frame(significant_corrs_uc[, c("gene1", "gene2")], directed = FALSE)
+g_uc <- simplify(g_uc)
+
+# Build HC network
+g_hc <- graph_from_data_frame(significant_corrs_hc[, c("gene1", "gene2")], directed = FALSE)
+g_hc <- simplify(g_hc)
+
+```
+
+
+
+### Exploratory Analysis
+```{r}
+# UC 组网络的节点数和边数
+uc_nodes <- vcount(g_uc)
+uc_edges <- ecount(g_uc)
+
+# HC 组网络的节点数和边数
+hc_nodes <- vcount(g_hc)
+hc_edges <- ecount(g_hc)
+
+# 输出结果
+cat("UC 组网络的节点数:", uc_nodes, "\n")
+cat("UC 组网络的边数:", uc_edges, "\n")
+cat("HC 组网络的节点数:", hc_nodes, "\n")
+cat("HC 组网络的边数:", hc_edges, "\n")
+
+```
+
+```{r}
+# 计算网络密度
+uc_density <- edge_density(g_uc)
+hc_density <- edge_density(g_hc)
+
+# 计算平均度数
+uc_mean_degree <- mean(degree(g_uc))
+hc_mean_degree <- mean(degree(g_hc))
+
+cat("UC 组网络的密度:", uc_density, "\n")
+cat("UC 组网络的平均度数:", uc_mean_degree, "\n")
+
+cat("HC 组网络的密度:", hc_density, "\n")
+cat("HC 组网络的平均度数:", hc_mean_degree, "\n")
+
+
+# 计算 UC 组网络的平均聚类系数
+uc_clustering_coefficient <- transitivity(g_uc, type = "average")
+
+# 计算 HC 组网络的平均聚类系数
+hc_clustering_coefficient <- transitivity(g_hc, type = "average")
+
+# 输出结果
+cat("UC 组网络的平均聚类系数:", uc_clustering_coefficient, "\n")
+cat("HC 组网络的平均聚类系数:", hc_clustering_coefficient, "\n")
+```
+
+
+## 6. Statistical Test for Covariance Differences Using PEtests
+We use the covtest function from the PEtests package to compare the covariance matrices of the two groups using various methods.
+
+\section{Covariance Testing Between UC and HC Groups}
+
+In this section, we conduct covariance tests between the residuals from the UC and HC groups. Covariance testing assesses whether the covariance structures of the gene expression residuals differ significantly between the two groups.
+
+\subsection{Preparation of Data}
+
+We start by preparing the residual data from both groups for testing. The residual matrices for the UC group ($R_{\text{UC}}$) and the HC group ($R_{\text{HC}}$) are filtered to remove genes with zero variance across samples, as zero-variance genes contribute no information to the covariance structure. Additionally, we ensure that only the genes common to both groups are used for testing:
+
+$$
+R_{\text{UC}}^{\prime} = \{ g \in R_{\text{UC}} : \text{Var}(g) > 0 \}
+$$
+$$
+R_{\text{HC}}^{\prime} = \{ g \in R_{\text{HC}} : \text{Var}(g) > 0 \}
+$$
+We then extract the common genes:
+$$
+G_{\text{common}} = \{ g : g \in \text{columns of } R_{\text{UC}}^{\prime} \text{ and } R_{\text{HC}}^{\prime} \}
+$$
+The data matrices for UC and HC groups, $X_{\text{UC}}$ and $X_{\text{HC}}$, are restricted to these common genes.
+
+\subsection{Covariance Matrix Comparison}
+Covariance matrices represent the pairwise covariances between genes. We wish to test whether the covariance matrices for UC and HC groups are significantly different. Let:
+
+$$
+\Sigma_{\text{UC}} = \text{Cov}(X_{\text{UC}})
+$$
+
+$$
+\Sigma_{\text{HC}} = \text{Cov}(X_{\text{HC}})
+$$
+
+We perform several statistical tests to compare the covariance matrices$\Sigma_{\text{UC}}$and$\Sigma_{\text{HC}}$using different methods:
+
+\subsection{Ledoit-Wolf Test (lc)}
+The Ledoit-Wolf test assumes the covariance matrices follow a structure with some shrinkage. It compares the covariance matrices by applying shrinkage towards a target (such as the identity matrix). The test statistic is:
+
+$$
+T_{\text{lc}} = \frac{1}{p} \left\| \Sigma_{\text{UC}} - \Sigma_{\text{HC}} \right\|^2
+$$
+
+where$\left\| \cdot \right\|$is the Frobenius norm and$p$is the number of genes. The null hypothesis is:
+
+$$
+H_0: \Sigma_{\text{UC}} = \Sigma_{\text{HC}}
+$$
+
+This test is suitable for high-dimensional settings.
+
+\subsection{CLX Test (clx)}
+The Cai-Liu-Xia (CLX) test is designed for high-dimensional covariance matrices. It compares the largest entry-wise difference between two covariance matrices:
+
+$$
+T_{\text{clx}} = \max_{1 \leq i,j \leq p} \left| \Sigma_{\text{UC}, ij} - \Sigma_{\text{HC}, ij} \right|
+$$
+
+where$\Sigma_{\text{UC}, ij}$and$\Sigma_{\text{HC}, ij}$are the$ij$-th entries of the covariance matrices. The test checks whether the maximum element-wise difference is significant.
+
+\subsection{Cauchy Combination Test (pe.cauchy)}
+The Cauchy combination test combines multiple test statistics using a weighted sum and evaluates significance based on the properties of the Cauchy distribution. The test statistic is a weighted sum of individual test statistics:
+
+$$
+T_{\text{Cauchy}} = \sum_{i=1}^{p} w_i T_i
+$$
+
+where$T_i$are individual test statistics and$w_i$are the weights. The null distribution of the weighted sum follows a Cauchy distribution, making it a robust method for high-dimensional data.
+
+\subsection{Composite Test (pe.comp)}
+The composite test assesses whether a combination of factors explains the covariance difference between UC and HC. This test aggregates multiple hypotheses and evaluates whether the combined effect significantly differs between the two groups:
+
+$$
+T_{\text{comp}} = f(T_{\text{indiv}}), \quad T_{\text{indiv}} = \{\text{individual test statistics} \}
+$$
+
+where$f$is a function combining the individual test results. This test is useful when multiple factors are suspected to contribute to the covariance differences.
+
+\subsection{Fisher Test (pe.fisher)}
+The Fisher test combines$p$-values from different tests and computes the combined test statistic using Fisher’s method:
+
+$$
+T_{\text{Fisher}} = -2 \sum_{i=1}^{p} \log(p_i)
+$$
+
+where$p_i$are the$p$-values from each individual test. Under the null hypothesis, $T_{\text{Fisher}}$ follows a chi-squared distribution with$2p$degrees of freedom. This test is sensitive to small$p$-values, making it useful for detecting differences in covariance when there are a few highly significant differences.
+```{r}
+# Ensure there are no zero variance genes
+data_uc_t <- data_uc_t[, apply(data_uc_t, 2, var) > 0]
+data_hc_t <- data_hc_t[, apply(data_hc_t, 2, var) > 0]
+
+# Keep common genes between both groups
+common_genes <- intersect(colnames(data_uc_t), colnames(data_hc_t))
+data_uc_t <- data_uc_t[, common_genes]
+data_hc_t <- data_hc_t[, common_genes]
+```
+
+```{r}
+# Perform covariance tests using different methods
+cov_test_result_lc <- covtest(data_uc_t, data_hc_t, method = 'lc')
+cov_test_result_clx <- covtest(data_uc_t, data_hc_t, method = 'clx')
+cov_test_result_cauchy <- covtest(data_uc_t, data_hc_t, method = 'pe.cauchy')
+cov_test_result_comp <- covtest(data_uc_t, data_hc_t, method = 'pe.comp')
+cov_test_result_fisher <- covtest(data_uc_t, data_hc_t, method = 'pe.fisher')
+```
+
+```{r}
+# Print the results
+print("Covariance Test Results:")
+print(cov_test_result_lc)
+print(cov_test_result_clx)
+print(cov_test_result_cauchy)
+print(cov_test_result_comp)
+print(cov_test_result_fisher)
+```
+
+
+\subsection{Results}
+After performing the covariance tests, we compare the results of the different methods. Each test returns a test statistic and a corresponding $p$ -value. If the $p$ -value is below a predefined threshold (e.g., $\alpha = 0.05$ ), we reject the null hypothesis, concluding that the covariance matrices for the UC and HC groups differ significantly.
+
+### Random Projection Covariance Test
+\section{Random Projection Covariance Test}
+
+The random projection covariance test aims to assess differences in covariance structures between the UC and HC groups. It uses random projection techniques to reduce the dimensionality of the data, making the comparison more computationally feasible for high-dimensional gene expression data.
+
+\subsection{Random Projection Framework}
+
+Let the residual data matrices for the UC and HC groups be denoted as:
+
+$$
+X_{\text{UC}} \in \mathbb{R}^{n_1 \times p}, \quad X_{\text{HC}} \in \mathbb{R}^{n_2 \times p}
+$$
+
+where $n_1$ and $n_2$ are the number of samples in each group, and $p$ is the number of genes (dimensions). Random projection is applied to both groups to reduce the dimensionality from $p$ to $q$ , where $q \ll p$ . The random projection matrix $R \in \mathbb{R}^{p \times q}$ is defined such that the columns of$R$are orthonormal:
+
+$$
+R = \text{qr}(R')
+$$
+where $R' \in \mathbb{R}^{p \times q}$ is a matrix of independent standard normal variables.
+
+\subsection{Projected Data Covariance Matrices}
+After projecting the original data into a lower-dimensional space, we obtain:
+
+$$
+Z_{\text{UC}} = X_{\text{UC}} R, \quad Z_{\text{HC}} = X_{\text{HC}} R
+$$
+
+where $Z_{\text{UC}} \in \mathbb{R}^{n_1 \times q}$ and $Z_{\text{HC}} \in \mathbb{R}^{n_2 \times q}$ are the projected data matrices. We then compute the covariance matrices for the projected data:
+
+$$
+\Sigma_{\text{UC}}^Z = \text{Cov}(Z_{\text{UC}}), \quad \Sigma_{\text{HC}}^Z = \text{Cov}(Z_{\text{HC}})
+$$
+
+\subsection{Test Statistic for Covariance Differences}
+The test statistic is based on the$L_2$norm of the difference between the projected covariance matrices:
+
+$$
+T_n = \|\Sigma_{\text{UC}}^Z - \Sigma_{\text{HC}}^Z\|_F^2 = \sum_{i=1}^{q} \sum_{j=1}^{q} \left( \Sigma_{\text{UC}, ij}^Z - \Sigma_{\text{HC}, ij}^Z \right)^2
+$$
+
+where $\|\cdot\|_F$ is the Frobenius norm. The statistic$T_n$quantifies the overall difference in covariance structures between the two groups after random projection.
+
+\subsection{Permutation Test for$p$-value Calculation}
+To assess the statistical significance of the observed test statistic$T_n$, we perform a permutation test. The labels of the UC and HC samples are randomly permuted, and the test statistic is recomputed for each permutation. The steps are as follows:
+
+\begin{enumerate}
+    \item Merge the UC and HC data matrices into a single matrix:
+$$
+    X_{\text{merged}} = \begin{bmatrix} X_{\text{UC}} \\ X_{\text{HC}} \end{bmatrix} \in \mathbb{R}^{(n_1 + n_2) \times p}
+$$
+    \item For each permutation, randomly shuffle the sample labels and split the merged data into two groups of sizes $n_1$ and $n_2$.
+    \item Apply random projection to the permuted data and compute the test statistic$T_n^{\text{perm}}$for each permutation.
+\end{enumerate}
+
+Let $T_n^{\text{perm}}$ be the test statistic for the permuted data. The$p$-value is then calculated as the proportion of permutations where the permuted test statistic exceeds the observed test statistic:
+
+$$
+p = \frac{1}{B} \sum_{b=1}^{B} I(T_n^{\text{perm}, b} \geq T_n)
+$$
+
+where $B$ is the number of permutations, and$I(\cdot)$is the indicator function.
+
+\subsection{Results}
+The random projection covariance test returns a test statistic$T_n$and a$p$-value. If the$p$-value is less than the significance level (e.g.,$\alpha = 0.05$), we reject the null hypothesis and conclude that the covariance structures for the UC and HC groups differ significantly.
+
+\begin{verbatim}
+\text{Random Projection Covariance Test Result:}
+\text{Maximum Test Statistic: } T_n
+\text{P-value: } p
+\end{verbatim}
+
+If the $p$ -value is small, it indicates significant differences between the covariance structures of the UC and HC groups after projection.
+
+```{r}
+# 定义参数
+n1 <- nrow(data_uc_t)  # UC 组样本数量
+n2 <- nrow(data_hc_t)  # HC 组样本数量
+p <- ncol(data_uc_t)   # 数据维度（基因数量）
+q <- 20                   # 随机投影的维度，可以尝试 5、10、20、30 等
+K <- 1000                  # 随机投影的次数
+B <- 5000                 # 置换次数，用于计算 p 值
+
+# 合并数据
+X1 <- data_uc_t        # UC 组数据
+X2 <- data_hc_t        # HC 组数据
+
+# 使用并行计算
+library(parallel)
+num_cores <- detectCores() - 1  # 保留一个核心用于系统
+cl <- makeCluster(num_cores)
+clusterExport(cl, varlist = c("X1", "X2", "n1", "n2", "p", "q"))
+clusterEvalQ(cl, library(Matrix))
+
+# 定义函数来计算单次随机投影的测试统计量
+compute_stat <- function(k) {
+  # 生成随机投影矩阵（正交矩阵）
+  R <- matrix(rnorm(p * q), nrow = p, ncol = q)
+  R <- qr.Q(qr(R))  # 正交化
+  
+  # 对数据进行投影
+  Z1 <- X1 %*% R    # n1 x q
+  Z2 <- X2 %*% R    # n2 x q
+  
+  # 计算两组投影数据的协方差矩阵
+  S1 <- cov(Z1)
+  S2 <- cov(Z2)
+  
+  # 计算测试统计量（L2 范数的平方）
+  stat <- sum((S1 - S2)^2)
+  return(list(stat = stat, Z_total = rbind(Z1, Z2)))
+}
+
+# 计算 K 次随机投影的测试统计量
+set.seed(123)
+results <- parLapply(cl, 1:K, compute_stat)
+stopCluster(cl)
+
+# 提取测试统计量和合并投影数据
+test_stats <- sapply(results, function(x) x$stat)
+Z_totals <- lapply(results, function(x) x$Z_total)
+
+# 取最大测试统计量
+Tn <- max(test_stats)
+
+# 通过置换法计算 p 值
+# 合并所有投影后的数据
+Z_total_combined <- do.call(rbind, Z_totals)
+n_total <- n1 + n2
+
+# 定义置换函数
+compute_perm_stats <- function(b) {
+  # 随机打乱标签
+  perm_indices <- sample(n_total)
+  perm_group1 <- perm_indices[1:n1]
+  perm_group2 <- perm_indices[(n1 + 1):n_total]
+  
+  # 初始化置换统计量的向量
+  perm_stats_b <- numeric(K)
+  
+  for (k in 1:K) {
+    Z_total <- Z_totals[[k]]
+    perm_Z1 <- Z_total[perm_group1, ]
+    perm_Z2 <- Z_total[perm_group2, ]
+    
+    # 计算协方差矩阵
+    perm_S1 <- cov(perm_Z1)
+    perm_S2 <- cov(perm_Z2)
+    
+    # 计算测试统计量
+    perm_stat <- sum((perm_S1 - perm_S2)^2)
+    perm_stats_b[k] <- perm_stat
+  }
+  
+  # 返回当前置换中的最大测试统计量
+  max(perm_stats_b)
+}
+
+# 使用并行计算进行置换测试
+cl <- makeCluster(num_cores)
+clusterExport(cl, varlist = c("Z_totals", "n1", "n2", "n_total", "K"))
+clusterEvalQ(cl, library(Matrix))
+
+set.seed(456)
+perm_stats <- parSapply(cl, 1:B, compute_perm_stats)
+stopCluster(cl)
+
+# 计算 p 值
+p_value <- mean(perm_stats >= Tn)
+
+# 输出结果
+cat("随机投影测试的最大测试统计量 Tn:", Tn, "\n")
+cat("p 值:", p_value, "\n")
+
+```
+```{r}
+# 打印随机投影测试的结果
+print("Random Projection Covariance Test Result:")
+cat("Maximum Test Statistic Tn:", Tn, "\n")
+cat("P-value:", p_value, "\n")
+```
+
+### 7. Subsampling and Motif Analysis
+We perform motif analysis by subsampling nodes from the networks and calculating motif counts in the subgraphs.
+
+
+```{r}
+# 定义归一化的基序计数函数
+count_normalized_motifs <- function(graph) {
+  num_nodes <- vcount(graph)
+  
+  motif_counts <- list(
+    triangle = 0,
+    v_shape = 0,
+    three_star = 0,
+    square = 0
+  )
+  
+  if (num_nodes < 3) {
+    return(motif_counts)  # 如果节点数量不足，返回空结果
+  }
+
+  # 计算三角形
+  triangle_counts <- count_triangles(graph)
+  total_triangles <- sum(triangle_counts) / 3
+  max_triangles <- choose(num_nodes, 3)
+  motif_counts$triangle <- total_triangles / max_triangles  # 归一化计数
+
+  # 计算 V 形
+  degrees <- degree(graph)
+  total_vshapes <- sum(choose(degrees, 2)) - 3 * total_triangles
+  max_vshapes <- choose(num_nodes, 2) * (num_nodes - 2)
+  motif_counts$v_shape <- total_vshapes / max_vshapes
+
+  # 计算 3 星
+  total_three_stars <- sum(choose(degrees, 3))
+  max_three_stars <- choose(num_nodes, 3) * (num_nodes - 3)
+  motif_counts$three_star <- total_three_stars / max_three_stars
+
+  # 计算四边形
+  if (num_nodes >= 4) {
+    adj <- as_adj(graph, sparse = FALSE)
+    adj2 <- adj %*% adj
+    adj2_adj2 <- adj2 * adj2
+    square_count <- sum(adj2_adj2) / 2 - sum(diag(adj2_adj2)) / 2
+    max_squares <- choose(num_nodes, 4)
+    motif_counts$square <- square_count / (8 * max_squares)
+  }
+  
+  return(motif_counts)
+}
+```
+
+```{r}
+# 定义子图采样并计算基序计数的单线程函数，加入进度条
+subgraph_motif_counts_single <- function(graph, sample_size, num_samples) {
+  pb <- progress_bar$new(
+    format = "Processing [:bar] :percent in :elapsed",
+    total = num_samples, clear = FALSE, width = 60
+  )
+
+  all_sampled_nodes <- replicate(num_samples, sample(V(graph)$name, sample_size), simplify = FALSE)
+  motif_counts_list <- list()
+
+  for (i in seq_len(num_samples)) {
+    sampled_nodes <- all_sampled_nodes[[i]]
+    subgraph <- induced_subgraph(graph, sampled_nodes)
+    motifs <- count_normalized_motifs(subgraph)
+    motif_counts_list[[i]] <- motifs
+    pb$tick()
+    if (i %% 50 == 0) gc()
+  }
+  
+  return(motif_counts_list)
+}
+
+```
+
+```{r}
+sample_size <- 500
+num_samples <- 2000
+
+motif_counts_uc <- subgraph_motif_counts_single(g_uc, sample_size, num_samples)
+motif_counts_hc <- subgraph_motif_counts_single(g_hc, sample_size, num_samples)
+
+```
+
+```{r}
+# 转换为数据框
+motif_data_uc <- do.call(rbind, lapply(motif_counts_uc, as.data.frame))
+motif_data_uc$group <- "UC"
+
+motif_data_hc <- do.call(rbind, lapply(motif_counts_hc, as.data.frame))
+motif_data_hc$group <- "HC"
+
+motif_data <- rbind(motif_data_uc, motif_data_hc)
+
+# 转换为长格式以便绘图
+motif_data_long <- reshape2::melt(motif_data, id.vars = "group", 
+                                  measure.vars = c("triangle", "v_shape", "three_star", "square"),
+                                  variable.name = "motif_type", value.name = "count")
+
+# 绘制基序计数分布图
+ggplot(motif_data_long, aes(x = group, y = count, fill = motif_type)) +
+  geom_violin(trim = FALSE, position = position_dodge(width = 0.75)) +
+  geom_boxplot(width = 0.1, position = position_dodge(width = 0.75), outlier.shape = NA) +
+  theme_minimal() +
+  labs(title = "Motif Counts Distribution",
+       x = "Group", y = "Normalized Motif Counts") +
+  scale_fill_manual(values = c("triangle" = "red", "v_shape" = "yellow", 
+                               "three_star" = "green", "square" = "blue"))
+```
+
+
+```{r}
+# 确保正确提取基序计数的函数
+extract_motif_counts <- function(motif_counts_list, motifs) {
+  # 将每个子样本的基序计数提取为矩阵形式
+  motif_matrix <- do.call(rbind, lapply(motif_counts_list, function(x) {
+    sapply(motifs, function(motif) x[[motif]], simplify = TRUE)
+  }))
+  return(motif_matrix)
+}
+
+# 从 UC 和 HC 的结果中提取基序计数矩阵
+motifs <- c("triangle", "v_shape", "three_star", "square")
+counts_matrix_uc <- extract_motif_counts(motif_counts_uc, motifs)
+counts_matrix_hc <- extract_motif_counts(motif_counts_hc, motifs)
+
+# 合并 UC 和 HC 的计数矩阵
+counts_combined <- rbind(counts_matrix_uc, counts_matrix_hc)
+
+# 创建组标签
+group_labels <- c(rep("UC", nrow(counts_matrix_uc)), rep("HC", nrow(counts_matrix_hc)))
+
+# 更新子采样与协方差矩阵的计算，确保多元分布的一致性
+bootstrap_test_cov <- function(counts_matrix, group_labels, num_bootstrap, motifs) {
+  n_uc <- sum(group_labels == "UC")
+  n_hc <- sum(group_labels == "HC")
+
+  # 计算观察到的协方差矩阵及其差异
+  cov_uc <- cov(counts_matrix[group_labels == "UC", , drop = FALSE])
+  cov_hc <- cov(counts_matrix[group_labels == "HC", , drop = FALSE])
+  observed_stat <- sum((cov_uc - cov_hc)^2)
+
+  # 进行 Bootstrap 检验
+  perm_stats <- numeric(num_bootstrap)
+  for (b in 1:num_bootstrap) {
+    permuted_labels <- sample(group_labels)
+    cov_uc_perm <- cov(counts_matrix[permuted_labels == "UC", , drop = FALSE])
+    cov_hc_perm <- cov(counts_matrix[permuted_labels == "HC", , drop = FALSE])
+    perm_stats[b] <- sum((cov_uc_perm - cov_hc_perm)^2)
+  }
+
+  # 计算 p 值
+  p_value <- mean(perm_stats >= observed_stat)
+  return(p_value)
+}
+
+
+# 运行 Bootstrap 检验
+num_bootstrap <- 10000  # 根据需要调整
+p_value <- bootstrap_test_cov(counts_combined, group_labels, num_bootstrap, motifs)
+cat("Bootstrap 检验的 p 值：", p_value, "\n")
+
+```
+
+
+
+```{r}
+# 加载LinkComm包（如果尚未安装，可以先执行 install.packages("LinkComm")）
+# library(linkcomm)
+
+# 生成网络的边列表
+# edges_uc <- get.edgelist(g_uc)
+
+# 对 UC 网络进行链接社区检测
+# link_comm_uc <- getLinkCommunities(edges_uc, hcmethod = "average")
+
+# 输出社区数量
+# cat("Number of link communities in UC network:", length(link_comm_uc$communities), "\n")
+```
+
